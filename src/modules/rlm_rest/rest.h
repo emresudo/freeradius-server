@@ -48,9 +48,9 @@ DIAG_ON(documentation)
 #endif
 
 #define REST_URI_MAX_LEN		2048
-#define REST_BODY_MAX_LEN		8192
+#define REST_BODY_MAX_LEN		81920
 #define REST_BODY_INIT			1024
-#define REST_BODY_MAX_ATTRS		256
+#define REST_BODY_MAX_ATTRS		2560
 
 typedef enum {
 	HTTP_METHOD_UNKNOWN = 0,

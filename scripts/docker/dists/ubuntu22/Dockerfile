@@ -29,13 +29,13 @@ COPY . .
 #  Clean up tree - we want to build from the latest commit, not from
 #  any cruft left around on the local system
 #
-RUN git clean -fdxx \
- && git reset --hard HEAD
+# RUN git clean -fdxx \
+#  && git reset --hard HEAD
 
-ARG release
-RUN [ -z "$release" ] || git checkout ${release} ; \
-    git status ; \
-    git log -1 --oneline
+# ARG release
+# RUN [ -z "$release" ] || git checkout ${release} ; \
+#     git status ; \
+#     git log -1 --oneline
 
 #
 #  Install build dependencies
