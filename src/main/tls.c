@@ -64,7 +64,10 @@ USES_APPLE_DEPRECATED_API	/* OpenSSL API has been deprecated by Apple */
 #  include <openssl/provider.h>
 
 static OSSL_PROVIDER *openssl_default_provider = NULL;
+
+#ifndef WITH_FIPS
 static OSSL_PROVIDER *openssl_legacy_provider = NULL;
+#endif
 #endif
 
 #define LOG_PREFIX "tls"
@@ -495,6 +498,18 @@ tls_session_t *tls_new_client_session(TALLOC_CTX *ctx, fr_tls_server_conf_t *con
 
 	if (conf->fix_cert_order) {
 		SSL_set_ex_data(ssn->ssl, FR_TLS_EX_INDEX_FIX_CERT_ORDER, (void *) &conf->fix_cert_order);
+	}
+
+	/*
+	 *	Set SNI, if configured.
+	 *
+	 *	The OpenSSL API says the filename is "char
+	 *	const *", but some versions have it as "void
+	 *	*", without the "const".  So we un-const it
+	 *	here through various C magic.
+	 */
+	if (conf->client_hostname) {
+		(void) SSL_set_tlsext_host_name(ssn->ssl, (void *) (uintptr_t) conf->client_hostname);
 	}
 
 	/*
@@ -1308,9 +1323,11 @@ void tls_session_information(tls_session_t *tls_session)
 
 				case SSL3_AD_ILLEGAL_PARAMETER:
 					str_details2 = " illegal_parameter";
+#ifdef PSK_MAX_IDENTITY_LEN
 					if (tls_session->conf->psk_identity || tls_session->conf->psk_query) {
 						details = "the client and server have different values for the PSK";
 					}
+#endif
 					break;
 
 				case TLS1_AD_UNKNOWN_CA:
@@ -2997,7 +3014,7 @@ int cbtls_verify(int ok, X509_STORE_CTX *ctx)
 	buf[0] = '\0';
 	sn = X509_get_serialNumber(client_cert);
 
-	RDEBUG2("(TLS) %s - Creating attributes from %d certificate in chain", conf->name, lookup + 1);
+	RDEBUG2("(TLS) %s - Creating attributes from certificate %d in chain", conf->name, lookup + 1);
  	RINDENT();
 
 	/*
@@ -3077,30 +3094,33 @@ int cbtls_verify(int ok, X509_STORE_CTX *ctx)
 	/*
 	 *	Get the Certificate Distribution points
 	 */
-	crl_dp = X509_get_ext_d2i(client_cert, NID_crl_distribution_points, NULL, NULL);
-	if (crl_dp) {
-		DIST_POINT *dp;
-		const char *url_ptr;
+	if (certs && (lookup <= 1)) {
+		crl_dp = X509_get_ext_d2i(client_cert, NID_crl_distribution_points, NULL, NULL);
 
-		for (int i = 0; i < sk_DIST_POINT_num(crl_dp); i++) {
-			size_t len;
-			char cdp[1024];
+		if (crl_dp) {
+			DIST_POINT *dp;
+			const char *url_ptr;
 
-			dp = sk_DIST_POINT_value(crl_dp, i);
-			if (!dp) continue;
+			for (int i = 0; i < sk_DIST_POINT_num(crl_dp); i++) {
+				size_t len;
+				char cdp[1024];
 
-			url_ptr = get_cdp_url(dp);
-			if (!url_ptr) continue;
+				dp = sk_DIST_POINT_value(crl_dp, i);
+				if (!dp) continue;
 
-			len = strlen(url_ptr);
-			if (len >= sizeof(cdp)) continue;
+				url_ptr = get_cdp_url(dp);
+				if (!url_ptr) continue;
 
-			memcpy(cdp, url_ptr, len + 1);
+				len = strlen(url_ptr);
+				if (len >= sizeof(cdp)) continue;
 
-			vp = fr_pair_make(talloc_ctx, certs, cert_attr_names[FR_TLS_CDP][lookup], cdp, T_OP_ADD);
-			rdebug_pair(L_DBG_LVL_2, request, vp, NULL);
+				memcpy(cdp, url_ptr, len + 1);
+
+				vp = fr_pair_make(talloc_ctx, certs, cert_attr_names[FR_TLS_CDP][lookup], cdp, T_OP_ADD);
+				rdebug_pair(L_DBG_LVL_2, request, vp, NULL);
+			}
+			sk_DIST_POINT_pop_free(crl_dp, DIST_POINT_free);
 		}
-		sk_DIST_POINT_pop_free(crl_dp, DIST_POINT_free);
 	}
 
 	/*
@@ -3644,7 +3664,7 @@ int tls_global_init(TLS_UNUSED bool spawn_flag, TLS_UNUSED bool check)
 	CONF_modules_load_file(NULL, NULL, 0);
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
-	EVP_set_default_properties(NULL, "fips=no");
+	EVP_set_default_properties(NULL, "-fips");
 #endif
 
 	/*
@@ -3676,6 +3696,7 @@ int tls_global_init(TLS_UNUSED bool spawn_flag, TLS_UNUSED bool check)
 		return -1;
 	}
 
+#ifndef WITH_FIPS
 	/*
 	 *	Needed for MD4
 	 *
@@ -3686,6 +3707,7 @@ int tls_global_init(TLS_UNUSED bool spawn_flag, TLS_UNUSED bool check)
 		ERROR("(TLS) Failed loading legacy provider");
 		return -1;
 	}
+#endif
 #endif
 
 	return 0;
@@ -3760,10 +3782,12 @@ void tls_global_cleanup(void)
 	}
 	openssl_default_provider = NULL;
 
+#ifndef WITH_FIPS
 	if (openssl_legacy_provider && !OSSL_PROVIDER_unload(openssl_legacy_provider)) {
 		ERROR("Failed unloading legacy provider");
 	}
 	openssl_legacy_provider = NULL;
+#endif
 #endif
 
 	CONF_modules_unload(1);
@@ -4086,6 +4110,13 @@ load_ca:
 
 #ifdef PSK_MAX_IDENTITY_LEN
 post_ca:
+#endif
+
+#ifdef SSL_OP_NO_RENEGOTIATION
+	/*
+	 *	This is never useful for anything.
+	 */
+	ctx_options |= SSL_OP_NO_RENEGOTIATION;
 #endif
 
 	/*
@@ -4777,6 +4808,8 @@ static int tls_realms_load(fr_tls_server_conf_t *conf)
 			ERROR("Failed inserting certificate file %s into hash table", buffer);
 			goto error;
 		}
+
+		DEBUG("(TLS) Loaded certificate file %s", buffer);
 	}
 
 	conf->realms = ht;

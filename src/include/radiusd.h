@@ -133,6 +133,7 @@ typedef struct main_config {
 	bool		proxy_requests;			//!< Toggle to enable/disable proxying globally.
 #endif
 	struct timeval	reject_delay;			//!< How long to wait before sending an Access-Reject.
+	bool		delay_proxy_rejects;		//!< do we delay proxied rejects
 	bool		status_server;			//!< Whether to respond to status-server messages.
 
 
@@ -204,7 +205,7 @@ typedef enum {
 	REQUEST_STOP_PROCESSING,
 	REQUEST_TO_FREE,			//!< in the queue, and the queue should free it
 } rad_master_state_t;
-#define REQUEST_MASTER_NUM_STATES (REQUEST_STOP_PROCESSING + 1)
+#define REQUEST_MASTER_NUM_STATES (REQUEST_TO_FREE + )
 
 typedef enum {
 	REQUEST_QUEUED = 1,
@@ -238,6 +239,7 @@ struct rad_request {
 	VALUE_PAIR		*config;	//!< #VALUE_PAIR (s) used to set per request parameters
 						//!< for modules and the server core at runtime.
 
+	TALLOC_CTX		*ctx;		//!< talloc ctx for the request.  Either a pool, or the request itself.
 	TALLOC_CTX		*state_ctx;	//!< for request->state
 	VALUE_PAIR		*state;		//!< #VALUE_PAIR (s) available over the lifetime of the authentication
 						//!< attempt. Useful where the attempt involves a sequence of
@@ -327,9 +329,8 @@ struct rad_request {
 #define RAD_REQUEST_LVL_DEBUG4	(4)
 
 #define RAD_REQUEST_OPTION_COA		(1 << 0)
-#define RAD_REQUEST_OPTION_CTX 		(1 << 1)
-#define RAD_REQUEST_OPTION_CANCELLED	(1 << 2)
-#define RAD_REQUEST_OPTION_STATS	(1 << 3)
+#define RAD_REQUEST_OPTION_CANCELLED	(1 << 1)
+#define RAD_REQUEST_OPTION_STATS	(1 << 2)
 
 #define SECONDS_PER_DAY		86400
 #define MAX_REQUEST_TIME	30
@@ -469,7 +470,7 @@ int	regex_request_to_sub(TALLOC_CTX *ctx, char **out, REQUEST *request, uint32_t
 /*
  *	Named capture groups only supported by PCRE.
  */
-#  ifdef HAVE_PCRE
+#  if defined(HAVE_PCRE) || defined(HAVE_PCRE2)
 int	regex_request_to_sub_named(TALLOC_CTX *ctx, char **out, REQUEST *request, char const *name);
 #  endif
 #endif
@@ -495,7 +496,7 @@ void		version_print(void);
 char	*auth_name(char *buf, size_t buflen, REQUEST *request, bool do_cli);
 int		rad_authenticate (REQUEST *);
 int		rad_postauth(REQUEST *);
-int		rad_virtual_server(REQUEST *);
+int		rad_virtual_server(REQUEST *, bool check_username);
 
 /* exec.c */
 pid_t radius_start_program(char const *cmd, REQUEST *request, bool exec_wait,

@@ -386,6 +386,7 @@ static void sd_watchdog_event(void *ctx)
 	DEBUG("Emitting systemd watchdog notification");
 	sd_notify(0, "WATCHDOG=1");
 
+	fr_event_now(s->el, &s->when);
 	timeradd(&s->when, &sd_watchdog_interval, &s->when);
 	if (!fr_event_insert(s->el, sd_watchdog_event, ctx, &s->when, &sd_watchdog_ev)) {
 		rad_panic("Failed to insert event");
@@ -597,8 +598,6 @@ static void request_timer(void *ctx)
  */
 void request_free(REQUEST *request)
 {
-	void *ptr;
-
 	rad_assert(request->ev == NULL);
 	rad_assert(!request->in_request_hash);
 	rad_assert(!request->in_proxy_hash);
@@ -612,14 +611,7 @@ void request_free(REQUEST *request)
 		return;
 	}
 
-	if ((request->options & RAD_REQUEST_OPTION_CTX) == 0) {
-		talloc_free(request);
-		return;
-	}
-
-	ptr = talloc_parent(request);
-	rad_assert(ptr != NULL);
-	talloc_free(ptr);
+	talloc_free(request->ctx);
 }
 
 
@@ -628,6 +620,8 @@ void request_free(REQUEST *request)
 void proxy_listener_freeze(rad_listen_t *listener, fr_event_fd_handler_t write_handler)
 {
 	PTHREAD_MUTEX_LOCK(&proxy_mutex);
+	if (listener->blocked) return;
+
 	if (!fr_packet_list_socket_freeze(proxy_list,
 					  listener->fd)) {
 		ERROR("Fatal error freezing socket: %s", fr_strerror());
@@ -654,6 +648,8 @@ void proxy_listener_freeze(rad_listen_t *listener, fr_event_fd_handler_t write_h
 void proxy_listener_thaw(rad_listen_t *listener)
 {
 	PTHREAD_MUTEX_LOCK(&proxy_mutex);
+	if (!listener->blocked) return;
+
 	if (!fr_packet_list_socket_thaw(proxy_list,
 					  listener->fd)) {
 		ERROR("Fatal error freezing socket: %s", fr_strerror());
@@ -1206,7 +1202,7 @@ static void request_queue_or_run(REQUEST *request,
 
 void request_inject(REQUEST *request)
 {
-	request_queue_or_run(request, request_running);
+	request_queue_or_run(request, request_running); /* child thread */
 }
 
 
@@ -1495,7 +1491,7 @@ static void request_finish(REQUEST *request, int action)
 	else if (request->packet->code == PW_CODE_ACCESS_REQUEST) {
 		if (request->reply->code == 0) {
 			vp = fr_pair_find_by_num(request->config, PW_AUTH_TYPE, 0, TAG_ANY);
-			if (!vp || (vp->vp_integer != 5)) {
+			if (!vp) {
 				RDEBUG2("There was no response configured: "
 					"rejecting request");
 			}
@@ -1606,7 +1602,7 @@ static void request_finish(REQUEST *request, int action)
 	 */
 	if ((request->packet->code == PW_CODE_ACCESS_REQUEST) &&
 	    (request->reply->code == PW_CODE_ACCESS_REJECT) &&
-	    (request->root->reject_delay.tv_sec > 0)) {
+	    ((request->root->reject_delay.tv_sec > 0) || (request->root->reject_delay.tv_usec > 0))) {
 		request->response_delay = request->root->reject_delay;
 
 		vp = fr_pair_find_by_num(request->reply->vps, PW_FREERADIUS_RESPONSE_DELAY, 0, TAG_ANY);
@@ -1640,11 +1636,36 @@ static void request_finish(REQUEST *request, int action)
 		 *	adding their own reject delay, which would
 		 *	result in N*reject_delays being applied.
 		 */
-		if (request->proxy && (!request->proxy_reply || request->proxy->dst_port != 0)) {
+		if (request->proxy && !request->root->delay_proxy_rejects &&
+		    (!request->proxy_reply || request->proxy->dst_port != 0)) {
 			request->response_delay.tv_sec = 0;
 			request->response_delay.tv_usec = 0;
 		}
 #endif
+
+		/*
+		 *	We want to delay for AT LEAST the delay.  We
+		 *	don't want to ADD in the delay.
+		 */
+		if ((request->response_delay.tv_sec != 0) ||
+		    (request->response_delay.tv_usec != 0)) {
+			struct timeval when;
+
+			/*
+			 *	if ((received time + delay) < now) {
+			 *		send packet
+			 *	else
+			 *		delay = (received time + delay) - now
+			 */
+			timeradd(&request->packet->timestamp, &request->response_delay, &when);
+
+			if (timercmp(&when, &request->reply->timestamp, <=)) {
+				request->response_delay.tv_sec = 0;
+				request->response_delay.tv_usec = 0;
+			} else {
+				timersub(&when, &request->reply->timestamp, &request->response_delay);
+			}
+		}
 	}
 
 	/*
@@ -1995,11 +2016,7 @@ skip_dup:
 		talloc_free(ctx);
 		return 1;
 	}
-
-	/*
-	 *	Mark it as a "real" request with a context.
-	 */
-	request->options |= RAD_REQUEST_OPTION_CTX;
+	request->ctx = ctx;
 
 	/*
 	 *	Remember the request in the list.
@@ -2046,7 +2063,8 @@ skip_dup:
 	 *	Otherwise, insert it into the state machine.
 	 *	The child threads will take care of processing it.
 	 */
-	request_queue_or_run(request, request_running);
+	ASSERT_MASTER;
+	request_queue_or_run(request, request_running); /* network thread - from listener */
 
 	return 1;
 }
@@ -2119,6 +2137,13 @@ static REQUEST *request_setup(TALLOC_CTX *ctx, rad_listen_t *listener, RADIUS_PA
 		request->server = listener->server;
 	} else {
 		request->server = NULL;
+	}
+
+	if (fr_debug_lvl) {
+		if (virtual_server_sanity_check(request) < 0) {
+			talloc_free(request);
+			return NULL;
+		}
 	}
 
 	request->root = &main_config;
@@ -2522,6 +2547,7 @@ static int insert_into_proxy_hash(REQUEST *request)
 #ifdef HAVE_PTHREAD_H
 			proxy_no_new_sockets = true;
 #endif
+			talloc_free(this);
 			PTHREAD_MUTEX_UNLOCK(&proxy_mutex);
 
 			/*
@@ -2774,6 +2800,24 @@ static int process_proxy_reply(REQUEST *request, RADIUS_PACKET *reply)
 		return 0;
 	}
 
+	/*
+	 *	If we have affinity, then maybe update State.  But
+	 *	only for Access-Request, and only if there's a State
+	 *	attribute in the reply.
+	 */
+	if (request->home_pool && request->home_pool->affinity_group &&
+	    (request->reply->code == PW_CODE_ACCESS_CHALLENGE) &&
+	    ((vp = fr_pair_find_by_num(request->reply->vps, PW_STATE, 0, TAG_ANY)) != NULL)) {
+		uint8_t *src;
+
+		src = talloc_array(vp, uint8_t, vp->vp_length + 1);
+		if (!src) return 0; 
+
+		src[0] = request->home_server->affinity;
+		memcpy(&src[1], vp->vp_octets, vp->vp_length);
+		fr_pair_value_memsteal(vp, src);
+	}
+
 	return 1;
 }
 
@@ -2807,6 +2851,7 @@ int request_proxy_reply(RADIUS_PACKET *packet)
 	char buffer[128];
 
 	VERIFY_PACKET(packet);
+	ASSERT_MASTER;
 
 	PTHREAD_MUTEX_LOCK(&proxy_mutex);
 	proxy_p = fr_packet_list_find_byreply(proxy_list, packet);
@@ -3322,7 +3367,7 @@ static int request_will_proxy(REQUEST *request)
 	} else if (((vp = fr_pair_find_by_num(request->config, PW_PACKET_DST_IP_ADDRESS, 0, TAG_ANY)) != NULL) ||
 		   ((vp = fr_pair_find_by_num(request->config, PW_PACKET_DST_IPV6_ADDRESS, 0, TAG_ANY)) != NULL)) {
 		uint16_t dst_port;
-		fr_ipaddr_t dst_ipaddr;
+		fr_ipaddr_t dst_ipaddr, src_ipaddr;
 
 		memset(&dst_ipaddr, 0, sizeof(dst_ipaddr));
 
@@ -3359,6 +3404,28 @@ static int request_will_proxy(REQUEST *request)
 			dst_port = vp->vp_integer;
 		}
 
+		if (((vp = fr_pair_find_by_num(request->config, PW_PACKET_SRC_IP_ADDRESS, 0, TAG_ANY)) != NULL) ||
+		    ((vp = fr_pair_find_by_num(request->config, PW_PACKET_SRC_IPV6_ADDRESS, 0, TAG_ANY)) != NULL)) {
+			if (((dst_ipaddr.af == AF_INET) && (vp->da->attr != PW_PACKET_SRC_IP_ADDRESS)) ||
+			    ((dst_ipaddr.af == AF_INET6) && (vp->da->attr != PW_PACKET_SRC_IPV6_ADDRESS))) {
+				REDEBUG("Cannot mix IPv4 and IPv6 source and destination addresses");
+				return 0;
+			}
+			if (vp->da->attr == PW_PACKET_SRC_IP_ADDRESS) {
+				src_ipaddr.af = AF_INET;
+				src_ipaddr.ipaddr.ip4addr.s_addr = vp->vp_ipaddr;
+				src_ipaddr.prefix = 32;
+			} else {
+				src_ipaddr.af = AF_INET6;
+				memcpy(&src_ipaddr.ipaddr.ip6addr, &vp->vp_ipv6addr, sizeof(vp->vp_ipv6addr));
+				src_ipaddr.prefix = 128;
+			}
+			home = home_server_find_bysrc(&dst_ipaddr, dst_port, IPPROTO_UDP, &src_ipaddr);
+			if (!home) home_server_find_bysrc(&dst_ipaddr, dst_port, IPPROTO_TCP, &src_ipaddr);
+			if (!home) goto no_home;
+			goto found_home;
+		}
+
 		/*
 		 *	Find the home server.
 		 */
@@ -3366,13 +3433,14 @@ static int request_will_proxy(REQUEST *request)
 		if (!home) home = home_server_find(&dst_ipaddr, dst_port, IPPROTO_TCP);
 		if (!home) {
 			char buffer[256];
-
+		no_home:
 			RWDEBUG("No such home server %s port %u",
 				inet_ntop(dst_ipaddr.af, &dst_ipaddr.ipaddr, buffer, sizeof(buffer)),
 				(unsigned int) dst_port);
 			return 0;
 		}
 
+	found_home:
 		/*
 		 *	The home server is alive (or may be alive).
 		 *	Send the packet to the IP.
@@ -3867,7 +3935,8 @@ static int request_proxy_anew(REQUEST *request)
 		REDEBUG2("Failed to find live home server for request");
 	post_proxy_fail:
 		if (setup_post_proxy_fail(request)) {
-			request_queue_or_run(request, proxy_running);
+			ASSERT_MASTER;
+			request_queue_or_run(request, proxy_running); /* network thread - timer */
 		} else {
 			gettimeofday(&request->reply->timestamp, NULL);
 			request_cleanup_delay_init(request);
@@ -4640,7 +4709,8 @@ static void proxy_wait_for_reply(REQUEST *request, int action)
 		}
 
 		if (setup_post_proxy_fail(request)) {
-			request_queue_or_run(request, proxy_no_reply);
+			ASSERT_MASTER;
+			request_queue_or_run(request, proxy_no_reply); /* network thread - timer */
 		} else {
 			gettimeofday(&request->reply->timestamp, NULL);
 			request_cleanup_delay_init(request);
@@ -4651,7 +4721,8 @@ static void proxy_wait_for_reply(REQUEST *request, int action)
 		 *	We received a new reply.  Go process it.
 		 */
 	case FR_ACTION_PROXY_REPLY:
-		request_queue_or_run(request, proxy_running);
+		ASSERT_MASTER;
+		request_queue_or_run(request, proxy_running); /* network thread - listener */
 		break;
 
 	default:
@@ -5025,7 +5096,8 @@ static void coa_retransmit(REQUEST *request)
 
 	fail:
 		if (setup_post_proxy_fail(request)) {
-			request_queue_or_run(request, coa_no_reply);
+			ASSERT_MASTER;
+			request_queue_or_run(request, coa_no_reply); /* network thread - timer */
 		} else {
 			request_done(request, FR_ACTION_DONE);
 		}
@@ -5159,7 +5231,8 @@ static bool coa_max_time(REQUEST *request)
 			       request->proxy->dst_port,
 			       mrd);
 			if (setup_post_proxy_fail(request)) {
-				request_queue_or_run(request, coa_no_reply);
+				ASSERT_MASTER;
+				request_queue_or_run(request, coa_no_reply); /* network thread - timer */
 			} else {
 				request_done(request, FR_ACTION_DONE);
 			}
@@ -5250,7 +5323,8 @@ static void coa_wait_for_reply(REQUEST *request, int action)
 		request->delay = (int)request->root->init_delay.tv_sec * USEC +
 			(int)request->root->init_delay.tv_usec;
 
-		request_queue_or_run(request, coa_running);
+		ASSERT_MASTER;
+		request_queue_or_run(request, coa_running); /* network thread - timer */
 		break;
 
 	default:
@@ -5527,7 +5601,13 @@ static void listener_free_cb(void *ctx)
 #ifdef WITH_TCP
 	fr_event_delete(el, &sock->ev);
 #endif
-	talloc_free(this);
+	if (this->type != RAD_LISTEN_PROXY) {
+		PTHREAD_MUTEX_LOCK(&proxy_mutex);
+		talloc_free(this);
+		PTHREAD_MUTEX_UNLOCK(&proxy_mutex);
+	} else {
+		talloc_free(this);
+	}
 }
 
 #ifdef WITH_PROXY
@@ -5638,13 +5718,12 @@ static void event_new_fd(void *ctx)
 			rad_assert((sock->proto == IPPROTO_UDP) || (sock->home != NULL));
 
 			/*
-			 *	Add timers to outgoing child sockets, if necessary.
+			 *	Add timers to outgoing TCP sockets.
 			 */
-			if (sock->proto == IPPROTO_TCP && sock->opened &&
-			    (sock->home->limit.lifetime || sock->home->limit.idle_timeout)) {
+			if (sock->proto == IPPROTO_TCP) {
 				struct timeval when;
 
-				when.tv_sec = sock->opened + 1;
+				when.tv_sec = time(NULL) + 1;
 				when.tv_usec = 0;
 
 				ASSERT_MASTER;
@@ -5677,13 +5756,12 @@ static void event_new_fd(void *ctx)
 		default:
 #ifdef WITH_TCP
 			/*
-			 *	Add timers to incoming child sockets, if necessary.
+			 *	Add timers to incoming TCP sockets;
 			 */
-			if (sock->proto == IPPROTO_TCP && sock->opened &&
-			    (sock->limit.lifetime || sock->limit.idle_timeout)) {
+			if (sock->proto == IPPROTO_TCP) {
 				struct timeval when;
 
-				when.tv_sec = sock->opened + 1;
+				when.tv_sec = time(NULL) + 1;
 				when.tv_usec = 0;
 
 				ASSERT_MASTER;

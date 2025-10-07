@@ -178,12 +178,11 @@ AC_ARG_ENABLE(fips-workaround,
 [  --enable-fips-workaround    enables local MD4, MD5, etc. functionality to avoid OpenSSL FIPS issues.],
 [ case "$enableval" in
   no)
-    fips=""
     ;;
   *)
-    fips="-DWITH_FIPS=1"
+    CFLAGS="$CFLAGS -DWITH_FIPS=1"
   esac ],
-[ fips="" ],
+[ ],
 )
 
 dnl #############################################################
@@ -1049,7 +1048,7 @@ else
 
   AC_SEARCH_LIBS(sem_init, pthread sem posix4 rt semaphore,
     [],
-    [AC_MSG_ERROR([[-lsem not found.  You may want to download it from ftp://ftp.to.gd-es.com/pub/BSDI/libsem.tar.bz2 or ftp://ftp.freeradius.org/pub/radius/contrib/libsem.tar.gz]])]
+    [AC_MSG_ERROR([[-lsem not found.  You may want to download it from ftp://ftp.to.gd-es.com/pub/BSDI/libsem.tar.bz2 or https://www.freeradius.org/ftp/pub/radius/contrib/libsem.tar.gz]])]
   )
 fi
 
@@ -1969,10 +1968,10 @@ if test "x$developer" = "xyes"; then
   dnl #
   AX_CC_WEVERYTHING_FLAG
   if test "x$ax_cv_cc_weverything_flag" = "xyes"; then
-    devcflags="$devcflags -W -Weverything -Wformat=2 -Wno-missing-field-initializers -Wno-date-time -Wno-padded -Wno-gnu-zero-variadic-macro-arguments -Wno-shorten-64-to-32 -Wno-sign-conversion -Wno-conversion -Wno-switch-enum -Wno-gnu-statement-expression -Wno-extended-offsetof -Wno-cast-align -Wno-documentation-unknown-command -Wno-covered-switch-default -Wno-packed $verify_ptr $fips"
+    devcflags="$devcflags -W -Weverything -Wformat=2 -Wno-missing-field-initializers -Wno-date-time -Wno-padded -Wno-gnu-zero-variadic-macro-arguments -Wno-shorten-64-to-32 -Wno-sign-conversion -Wno-conversion -Wno-switch-enum -Wno-gnu-statement-expression -Wno-extended-offsetof -Wno-cast-align -Wno-documentation-unknown-command -Wno-covered-switch-default -Wno-packed $verify_ptr
   else
     if test "x$GCC" = "xyes"; then
-      devcflags="$devcflags -Wshadow -Wpointer-arith -Wcast-qual -Wcast-align -Wwrite-strings -Wstrict-prototypes -Wmissing-prototypes -Wmissing-declarations -Wnested-externs -W -Wredundant-decls -Wundef -Wformat-y2k -Wno-format-extra-args -Wno-format-zero-length -Wno-cast-align -Wformat-nonliteral -Wformat-security -Wformat=2 $verify_ptr $fips"
+      devcflags="$devcflags -Wshadow -Wpointer-arith -Wcast-qual -Wcast-align -Wwrite-strings -Wstrict-prototypes -Wmissing-prototypes -Wmissing-declarations -Wnested-externs -W -Wredundant-decls -Wundef -Wformat-y2k -Wno-format-extra-args -Wno-format-zero-length -Wno-cast-align -Wformat-nonliteral -Wformat-security -Wformat=2 $verify_ptr
       INSTALLSTRIP=""
     fi
   fi
@@ -1990,7 +1989,7 @@ if test "x$developer" = "xyes"; then
     dnl #
     dnl #  -fsanitize=fuzzer  - Build with fuzzer support
     dnl #
-    fsanitizeflags="$fsanitizeflags,fuzzer"
+    fsanitizeflags="$fsanitizeflags,fuzzer-no-link"
   fi
 
   dnl #
@@ -2294,7 +2293,24 @@ if test "x$REGEX" != "xno" && test "x$PCRE" != "xno"; then
 fi
 
 dnl #
-dnl #  If no PCRE, fallback to POSIX regular expressions
+dnl #  If no PCRE, look for PCRE2
+dnl #
+if test "x$REGEX" = "x" && test "x$PCRE" != "xno"; then
+  smart_try_dir=$pcre_include_dir
+  FR_SMART_CHECK_INCLUDE(pcre2.h,[#define PCRE2_CODE_UNIT_WIDTH (8)])
+  if test "x$ac_cv_header_pcre2_h" = "xyes"; then
+    smart_try_dir=$pcre_lib_dir
+    FR_SMART_CHECK_LIB(pcre2-8, pcre2_compile_8)
+    if test "x$ac_cv_lib_pcre2_8_pcre2_compile_8" = "xyes"; then
+      REGEX=yes
+      AC_DEFINE(HAVE_PCRE2, [1], [define this if we have libpcre2])
+      AC_DEFINE(HAVE_BINSAFE_REGEX, 1, [Define if we have a binary safe regular expression library])
+    fi
+  fi
+fi
+
+dnl #
+dnl #  If no PCRE2 or PCRE, fallback to POSIX regular expressions
 dnl #
 if test "x$REGEX" = "x"; then
   smart_try_dir=
